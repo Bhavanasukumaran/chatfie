@@ -11,3 +11,9 @@ __pycache__/
 
 # Ignore other files
 *.log
+
+# Ignore virtual environments
+venv/
+
+# Ignore large music files
+static/music/*.mp3
