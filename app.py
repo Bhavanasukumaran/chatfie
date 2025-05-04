@@ -6,12 +6,14 @@ import numpy as np
 import tensorflow as tf
 import dlib
 import pickle
+import traceback
 from openai import OpenAI
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
 import random
 from authlib.integrations.flask_client import OAuth
 from flask_login import LoginManager, login_user, logout_user, login_required, UserMixin
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for, Response
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, Response, flash
+from werkzeug.utils import secure_filename
 from fuzzywuzzy import process
 from textblob import TextBlob
 from datetime import datetime, timedelta
@@ -31,8 +33,8 @@ app.config['GOOGLE_CLIENT_SECRET'] = os.getenv('GOOGLE_CLIENT_SECRET')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
 
 # Initialize OpenAI client
-openai_api_key = os.getenv('OPENAI_API_KEY')  # Fetch from .env file
-client = OpenAI(api_key=openai_api_key)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 # OAuth Setup
 oauth = OAuth(app)
@@ -55,6 +57,8 @@ with open('dataset/intents.json', encoding="utf-8") as file:
 
 detector = dlib.get_frontal_face_detector()
 model = tf.keras.models.load_model("FacialExpressionModel.h5")  # Fixed model loading
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+chat_model = GPT2LMHeadModel.from_pretrained("gpt2")
 
 
 socketio = SocketIO(app)
@@ -85,7 +89,6 @@ def find_best_match(user_input):
 
     return best_match, highest_score
 
-
 def detect_text_emotion(user_input):
     blob = TextBlob(user_input)
     sentiment = blob.sentiment.polarity
@@ -96,102 +99,101 @@ def contains_profanity(text):
         "fuck", "shit", "crap", "bitch", "damn", "asshole", "bastard",
         "hell", "dick", "piss", "slut", "whore", "retard", "nigga", "cunt"
     ]
-
     text = text.lower()
     words = re.findall(r'\b\w+\b', text)
-    return any(word in text for word in profane_words)
+    return any(word in words for word in profane_words)
 
 
 def generate_chat_response(user_input, chat_history=None):
-    # Step 1: Detect emotion and intent
     emotion = detect_text_emotion(user_input)
     matched_intent, confidence = find_best_match(user_input)
     default_response = "I'm not sure how to respond to that. Can you tell me more?"
 
-    # Step 2: Profanity Check (High Priority)
+    # 💬 Profanity Handling
     if contains_profanity(user_input):
         return "I know you’re feeling overwhelmed. Let's keep this space respectful so I can support you better. 💙"
 
-    # Step 3: Tech Support Mode (intent)
-    if matched_intent and matched_intent['tag'] == "tech_issue":
-        return random.choice(matched_intent.get("responses", [default_response]))
+    # 🎯 High-confidence tag-based replies
+    if matched_intent and confidence >= 90:
+        tag = matched_intent['tag']
 
-    # Step 4: About Tag - Say only once per session
-    if matched_intent and matched_intent['tag'] == "about":
-        if not session.get("greeted_about"):
-            session["greeted_about"] = True
-            return random.choice(matched_intent["responses"])
-        else:
-            return "I'm here for you. What's on your mind today?"
-
-    # Step 5: Use OpenAI for low confidence or unknown intents
-    if matched_intent is None or confidence < 90:
-        prompt = (
-            f"You're Chat-Fie, a helpful, empathetic, and slightly sassy AI assistant. "
-            f"The user said: '{user_input}'. They seem to be feeling {emotion.lower()}. "
-            f"Respond with warmth, emotional intelligence, and human-like relatability. "
-            f"Set gentle boundaries if the user is being rude or sarcastic."
-        )
-        response = get_openai_response(prompt, emotion=emotion, chat_history=chat_history)
-    else:
-        # Step 6: Use predefined response
-        response = random.choice(matched_intent.get("responses", [default_response]))
-    if matched_intent and confidence >= 88:
-        if matched_intent['tag'] == "tech_issue":
+        if tag == "tech_issue":
             return random.choice(matched_intent.get("responses", [default_response]))
 
-    if matched_intent['tag'] == "about":
-        if not session.get("greeted_about"):
-            session["greeted_about"] = True
-            return random.choice(matched_intent["responses"])
-        else:
-            return "I'm here for you. What's on your mind today?"
+        if tag == "about":
+            if not session.get("greeted_about"):
+                session["greeted_about"] = True
+                return random.choice(matched_intent["responses"])
+            else:
+                return "I'm here for you. What's on your mind today?"
 
+        return random.choice(matched_intent.get("responses", [default_response]))
 
-    # Step 7: Add emotion-based prefix for extra warmth
+    # 🧠 Fallback to OpenAI for uncertain or emotional input
+    if not emotion:  # If no emotion is detected
+        emotion = "neutral"
+
+    prompt = (
+        f"You're Chat-Fie, a helpful, empathetic, and slightly sassy AI assistant. "
+        f"User: {user_input}\nEmotion: {emotion.lower()}\nChat-Fie (respond empathetically and supportively):"
+        f"Respond with warmth, emotional intelligence, and human-like relatability. "
+        f"Set gentle boundaries if the user is being rude or sarcastic."
+    )
+
+    response = get_openai_response(prompt, emotion=emotion, chat_history=chat_history)
+
+    # 💌 Emotion Prefix
     emotion_prefix = {
-        "Sad": "I'm really sorry to hear that.",
-        "Happy": "That's wonderful to hear!",
-        "Angry": "I understand you're feeling upset.",
-        "Fearful": "That sounds concerning."
-    }.get(emotion, "")
+        "Sad": "I'm really sorry to hear that. Is there anything I can do to help? 💙",
+        "Happy": "That's wonderful to hear! I'm so glad you're feeling good! 😊",
+        "Angry": "I understand you're feeling upset. Want to talk about it?",
+        "Fearful": "That sounds concerning. Would you like to share what's going on?",
+        "Neutral": "I'm here to listen. What’s on your mind?"
+    }.get(emotion, "I'm here for you. What's going on?")
 
     return f"{emotion_prefix} {response}".strip()
 
-
-from openai import OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-client = OpenAI(api_key="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")
-
+# -------------------------- OpenAI Response --------------------------
 
 def get_openai_response(prompt, emotion=None, chat_history=None):
     try:
-        print("OpenAI Prompt:", prompt)  # 💡 For debugging
-
-        system_prompt = "You are Chat-Fie, a caring AI that listens and responds empathetically to users who may be experiencing stress, anxiety, or burnout."
-
-        if emotion:
-            system_prompt += f" The user seems to be {emotion.lower()}."
-
-        messages = [{"role": "system", "content": system_prompt}]
         if chat_history:
-            messages.extend(chat_history)
-        messages.append({"role": "user", "content": prompt})
+            history_text = "\n".join([msg['content'] for msg in chat_history])
+            prompt = f"{history_text}\n{prompt}"
 
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            max_tokens=200,
-            temperature=0.7
+        inputs = tokenizer.encode(prompt, return_tensors="pt", truncation=True, max_length=512)
+
+        output = chat_model.generate(
+            inputs,
+            max_length=inputs.shape[1] + 40,
+            num_return_sequences=1,
+            no_repeat_ngram_size=2,
+            top_p=0.9,
+            top_k=50,
+            temperature=0.7,
+            pad_token_id=tokenizer.eos_token_id
         )
 
-        return response.choices[0].message.content.strip()
+        full_text = tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # Remove the input part (prompt) to extract only the generated reply
+        if full_text.startswith(prompt):
+            response = full_text[len(prompt):].strip()
+        else:
+            response = full_text.strip()
+
+        # Extra cleanup: Sometimes GPT-2 ends with quotes or incomplete sentences
+        response = response.split('\n')[0].strip().strip('"').strip("'")
+
+        if not response:
+            return "I'm here for you. Can you share a bit more?"
+
+        return response
+
     except Exception as e:
-        import traceback
-        traceback.print_exc()  # See real error in console
+        print(f"GPT-2 error: {e}")
         return "I'm having trouble thinking right now. Can you try again?"
-
-
+    
 def analyze_text_sentiment(text):
     sentiment_score = TextBlob(text).sentiment.polarity
     if sentiment_score > 0.3:
@@ -258,6 +260,13 @@ def login_google():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+
+        # 🔐 Hardcoded admin login
+        if username == "admin" and password == "Admin@123":
+            session["admin"] = True
+            return redirect(url_for("admin_dashboard"))
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT id FROM registration WHERE username = ? AND password = ?", 
@@ -274,6 +283,12 @@ def login():
 def check_login():
     return {"logged_in": "user_id" in session}
 
+@app.route('/admin')
+def admin_dashboard():
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+    return render_template("admin_dashboard.html")
+
 @app.route('/profile')
 def profile():
     if "user_id" not in session:
@@ -281,11 +296,13 @@ def profile():
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT username, email FROM registration WHERE id = ?", (session["user_id"],))
+        cursor.execute("SELECT username, email, profile_pic FROM registration WHERE id = ?", (session["user_id"],))
         user = cursor.fetchone()
     
     if user:
-        return render_template("profile.html", username=user[0], email=user[1])
+        # If the user doesn't have a profile picture, use a default one
+        profile_pic = user[2] if user[2] else 'static/default_profile.png'
+        return render_template("profile.html", username=user[0], email=user[1], profile_pic=profile_pic)
     else:
         return "User not found!", 404
     
@@ -302,17 +319,47 @@ def edit_profile():
         name = request.form["name"]
         email = request.form["email"]
         gender = request.form["gender"]
+        file = request.files.get("profile_pic")
 
-        cursor.execute("UPDATE registration SET name=?, email=?, gender=? WHERE id=?", (name, email, gender, user_id))
+        # Get current profile pic path
+        cursor.execute("SELECT profile_pic FROM registration WHERE id=?", (user_id,))
+        row = cursor.fetchone()
+        profile_pic_path = row[0] if row else 'static/default_profile.png'
+
+        # If new profile picture is uploaded
+        if file and file.filename != "":
+            filename = secure_filename(file.filename)
+            upload_dir = os.path.join("static", "uploads")
+            os.makedirs(upload_dir, exist_ok=True)
+            filepath = os.path.join('static', 'uploads', filename)
+            file.save(filepath)
+            profile_pic_path = filepath
+
+        cursor.execute("""
+            UPDATE registration 
+            SET name=?, email=?, gender=?, profile_pic=?
+            WHERE id=?
+        """, (name, email, gender, profile_pic_path, user_id))
         conn.commit()
         conn.close()
+
+        flash("Profile updated successfully.")
         return redirect(url_for("profile"))
 
-    cursor.execute("SELECT name, email, gender FROM registration WHERE id=?", (user_id,))
+    # GET: Load existing data
+    cursor.execute("SELECT name, email, gender, profile_pic FROM registration WHERE id=?", (user_id,))
     user = cursor.fetchone()
     conn.close()
 
-    return render_template("edit_profile.html", user={"name": user[0], "email": user[1], "gender": user[2]})
+    if not user:
+        return "User not found", 404
+
+    return render_template("edit_profile.html", user={
+        "name": user[0],
+        "email": user[1],
+        "gender": user[2],
+        "profile_pic": user[3]
+    })
 
 @app.route("/login/callback")
 def auth_callback():
@@ -356,6 +403,47 @@ def logout():
     logout_user()
     session.clear()
     return redirect(url_for('home'))
+
+@app.route('/add_intent', methods=['POST'])
+def add_intent():
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+
+    tag = request.form["tag"]
+    patterns = request.form.getlist("patterns")
+    responses = request.form.getlist("responses")
+
+    with open('dataset/intents.json', 'r+', encoding="utf-8") as f:
+        data = json.load(f)
+        data['intents'].append({
+            "tag": tag,
+            "patterns": patterns,
+            "responses": responses
+        })
+        f.seek(0)
+        json.dump(data, f, indent=4, ensure_ascii=False)
+        f.truncate()
+
+    return redirect(url_for("admin_dashboard"))
+
+@app.route('/admin/feedback')
+def view_feedback():
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM feedback ORDER BY timestamp DESC")
+    feedback_data = cursor.fetchall()
+    conn.close()
+
+    return render_template("admin_feedback.html", feedback=feedback_data)
+
+@app.route('/admin_logout')
+def admin_logout():
+    session.pop("admin", None)
+    return redirect(url_for("login"))
+
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -677,13 +765,20 @@ def save_chat():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+@app.route('/feedback')
+def feedback_page():
+    if 'user_id' not in session:
+        flash("Login first to access the feedback page.")
+        return redirect('/')
+    return render_template('feedback.html')
+
 @app.route('/submit_feedback', methods=['POST'])
 def submit_feedback():
     data = request.get_json()
     rating = data.get('rating')
     feedback = data.get('comment')
     timestamp = data.get('timestamp')
-    user_id = session.get('user_id', None)  # Make sure session is active
+    user_id = session.get('user_id')
 
     if not user_id:
         return jsonify({'error': 'User not logged in'}), 403
@@ -698,6 +793,7 @@ def submit_feedback():
     conn.close()
 
     return jsonify({'status': 'success'})
+
 
 @app.route('/clear_chat_history', methods=['POST'])
 def clear_chat_history():

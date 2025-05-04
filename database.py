@@ -73,10 +73,11 @@ def create_tables():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS feedback (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                rating TEXT,
+                user_id INTEGER NOT NULL,
+                rating INTEGER,
                 feedback TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
             )
         ''')
 
